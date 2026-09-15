@@ -1,0 +1,134 @@
+name: Instagram Reel preview sync
+
+on:
+  schedule:
+    - cron: "17 */4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: instagram-reel-preview-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Import newly published Reels
+        env:
+          SYNC_URL: ${{ secrets.NYCDN_SYNC_URL }}
+          ADMIN_TOKEN: ${{ secrets.NYCDN_ADMIN_TOKEN }}
+        run: |
+          if [ -z "$SYNC_URL" ] || [ -z "$ADMIN_TOKEN" ]; then
+            echo "::error::The sync URL or administrator token is missing."
+            exit 1
+          fi
+
+          response_file="$(mktemp)"
+          http_code="$(curl --silent --show-error --location \
+            --retry 3 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 15 --max-time 240 \
+            --output "$response_file" --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer $ADMIN_TOKEN" \
+            "$SYNC_URL" || true)"
+
+          if ! [[ "$http_code" =~ ^2[0-9][0-9]$ ]] || ! jq -e '.synced == true' "$response_file" >/dev/null 2>&1; then
+            echo "::error::The production Reel sync did not complete (${http_code:-network error})."
+            jq '{error}' "$response_file" 2>/dev/null || true
+            exit 1
+          fi
+
+          jq '{synced, received, newestPublishedAt, repaired, mediaNeedsNormalization, pending}' "$response_file"
+
+      - name: Check the short-preview queue
+        id: queue
+        env:
+          MEDIA_BASE_URL: ${{ secrets.NYCDN_MEDIA_BASE_URL }}
+          MEDIA_UPLOAD_TOKEN: ${{ secrets.NYCDN_MEDIA_UPLOAD_TOKEN }}
+        run: |
+          if [ -z "$MEDIA_BASE_URL" ] || [ -z "$MEDIA_UPLOAD_TOKEN" ]; then
+            echo "::error::The media URL or upload token is missing."
+            exit 1
+          fi
+
+          response_file="$(mktemp)"
+          http_code="$(curl --silent --show-error \
+            --header "Authorization: Bearer $MEDIA_UPLOAD_TOKEN" \
+            --output "$response_file" --write-out '%{http_code}' \
+            "${MEDIA_BASE_URL%/}/api/admin/media-upload" || true)"
+
+          if ! [[ "$http_code" =~ ^2[0-9][0-9]$ ]] || ! jq -e '.jobs | type == "array"' "$response_file" >/dev/null 2>&1; then
+            echo "::error::The production preview queue is unavailable (${http_code:-network error})."
+            exit 1
+          fi
+
+          preview_count="$(jq '.jobs | length' "$response_file")"
+          recovery_count="$(jq '.recoveryJobs | length' "$response_file")"
+          echo "count=$((preview_count + recovery_count))" >> "$GITHUB_OUTPUT"
+          echo "preview_count=$preview_count" >> "$GITHUB_OUTPUT"
+          echo "recovery_count=$recovery_count" >> "$GITHUB_OUTPUT"
+          echo "Preview jobs: $preview_count; protected Reel recoveries: $recovery_count"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.queue.outputs.count != '0'
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        if: steps.queue.outputs.count != '0'
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        if: steps.queue.outputs.count != '0'
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install the preview processor
+        if: steps.queue.outputs.count != '0'
+        run: pnpm install --frozen-lockfile
+
+      - name: Install the protected-Reel helper
+        if: steps.queue.outputs.recovery_count != '0'
+        run: |
+          curl --fail --silent --show-error --location \
+            "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_linux" \
+            --output "$RUNNER_TEMP/yt-dlp"
+          curl --fail --silent --show-error --location \
+            "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/SHA2-256SUMS" \
+            --output "$RUNNER_TEMP/SHA2-256SUMS"
+          expected="$(awk '$2 == "yt-dlp_linux" {print $1}' "$RUNNER_TEMP/SHA2-256SUMS")"
+          if [ -z "$expected" ]; then
+            echo "::error::The yt-dlp checksum was not found."
+            exit 1
+          fi
+          echo "$expected  $RUNNER_TEMP/yt-dlp" | sha256sum --check
+          chmod 700 "$RUNNER_TEMP/yt-dlp"
+
+      - name: Recover short silent video for protected Reels
+        id: recovery
+        if: steps.queue.outputs.recovery_count != '0'
+        continue-on-error: true
+        env:
+          NYCDN_MEDIA_BASE_URL: ${{ secrets.NYCDN_MEDIA_BASE_URL }}
+          NYCDN_MEDIA_UPLOAD_TOKEN: ${{ secrets.NYCDN_MEDIA_UPLOAD_TOKEN }}
+          NYCDN_INSTAGRAM_COOKIES_B64: ${{ secrets.NYCDN_INSTAGRAM_COOKIES_B64 }}
+          YT_DLP_PATH: ${{ runner.temp }}/yt-dlp
+        run: pnpm media:recover
+
+      - name: Generate mini and featured previews
+        if: always() && steps.queue.outputs.count != '0'
+        env:
+          NYCDN_MEDIA_BASE_URL: ${{ secrets.NYCDN_MEDIA_BASE_URL }}
+          NYCDN_MEDIA_UPLOAD_TOKEN: ${{ secrets.NYCDN_MEDIA_UPLOAD_TOKEN }}
+        run: pnpm media:previews
+
+      - name: Require complete playable recovery
+        if: always() && steps.recovery.outcome == 'failure'
+        run: |
+          echo "::error::At least one protected Reel still needs playable preview media. It remains hidden and will retry automatically."
+          exit 1
