@@ -8,7 +8,8 @@ import ffmpegPath from "ffmpeg-static";
 const exec = promisify(execFile);
 const baseUrl = String(process.env.NYCDN_MEDIA_BASE_URL || "").replace(/\/$/, "");
 const token = String(process.env.NYCDN_MEDIA_UPLOAD_TOKEN || "");
-const jobLimit = Math.max(1, Math.min(100, Number(process.env.PREVIEW_JOB_LIMIT || 20)));
+const jobLimit = Math.max(1, Math.min(100, Number(process.env.PREVIEW_JOB_LIMIT || 100)));
+const concurrency = Math.max(1, Math.min(3, Number(process.env.PREVIEW_CONCURRENCY || 2)));
 
 if (!baseUrl || !token) throw new Error("NYCDN_MEDIA_BASE_URL and NYCDN_MEDIA_UPLOAD_TOKEN are required.");
 if (!ffmpegPath) throw new Error("The bundled ffmpeg executable is unavailable.");
@@ -67,7 +68,13 @@ async function upload(reelId, kind, settings, file) {
 
 let processed = 0;
 let failed = 0;
-for (const job of jobs) {
+let nextJob = 0;
+
+async function processNextJob() {
+  const jobIndex = nextJob;
+  nextJob += 1;
+  if (jobIndex >= jobs.length) return;
+  const job = jobs[jobIndex];
   const workspace = await mkdtemp(path.join(tmpdir(), "nycdn-previews-"));
   try {
     const sourceResponse = await fetch(job.sourceUrl, { signal: AbortSignal.timeout(120_000) });
@@ -89,7 +96,11 @@ for (const job of jobs) {
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
+
+  await processNextJob();
 }
 
-console.log(JSON.stringify({ queued: jobs.length, processed, failed }));
+await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, () => processNextJob()));
+
+console.log(JSON.stringify({ queued: jobs.length, concurrency, processed, failed }));
 if (failed) process.exitCode = 1;

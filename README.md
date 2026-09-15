@@ -5,3 +5,5 @@ This small public repository runs the scheduled NYC Date Nights Instagram Reel s
 It contains no application source code, venue database, user data, passwords, access tokens, or browser cookies. Production credentials are stored only as encrypted GitHub Actions secrets.
 
 The preview worker downloads only the opening seconds required for the app, removes audio, normalizes the clip, uploads the result to the private production media endpoint, and deletes its temporary files when the job finishes.
+
+Preview jobs run two at a time and drain up to 100 queued clips per run, while protected Reel downloads remain deliberately limited and sequential.
