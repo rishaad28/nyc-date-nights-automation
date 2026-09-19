@@ -1,20 +1,25 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import ffmpegPath from "ffmpeg-static";
+import bundledFfmpegPath from "ffmpeg-static";
 
 const exec = promisify(execFile);
 const baseUrl = String(process.env.NYCDN_MEDIA_BASE_URL || "").replace(/\/$/, "");
 const token = String(process.env.NYCDN_MEDIA_UPLOAD_TOKEN || "");
 const cookiesBase64 = String(process.env.NYCDN_INSTAGRAM_COOKIES_B64 || "");
 const ytDlpPath = String(process.env.YT_DLP_PATH || "yt-dlp");
+// The bundled binary can segfault when yt-dlp extracts a short Instagram
+// section on Ubuntu. GitHub's runner provides a system ffmpeg for this job.
+const ffmpegPath = String(process.env.FFMPEG_PATH ||
+  (existsSync("/usr/bin/ffmpeg") ? "/usr/bin/ffmpeg" : bundledFfmpegPath));
 const jobLimit = Math.max(1, Math.min(12, Number(process.env.RECOVERY_JOB_LIMIT || 4)));
 
 if (!baseUrl || !token) throw new Error("NYCDN_MEDIA_BASE_URL and NYCDN_MEDIA_UPLOAD_TOKEN are required.");
 if (!cookiesBase64) throw new Error("NYCDN_INSTAGRAM_COOKIES_B64 is required for protected Reel recovery.");
-if (!ffmpegPath) throw new Error("The bundled ffmpeg executable is unavailable.");
+if (!ffmpegPath) throw new Error("An ffmpeg executable is unavailable.");
 
 const headers = { authorization: `Bearer ${token}` };
 const response = await fetch(`${baseUrl}/api/admin/media-upload`, {
