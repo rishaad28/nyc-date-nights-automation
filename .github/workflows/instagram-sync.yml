@@ -92,6 +92,13 @@ jobs:
         if: steps.queue.outputs.count != '0'
         run: pnpm install --frozen-lockfile
 
+      - name: Install system ffmpeg for short Reel previews
+        if: steps.queue.outputs.recovery_count != '0'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          /usr/bin/ffmpeg -version | head -1
+
       - name: Install the protected-Reel helper
         if: steps.queue.outputs.recovery_count != '0'
         run: |
